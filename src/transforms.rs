@@ -1,13 +1,57 @@
+use async_trait::async_trait;
 use chrono::prelude::*;
 use jmespatch::{
     functions::{ArgumentType, CustomFunction, Signature},
     Context, ErrorReason, Expression, JmespathError, Rcvar, Runtime, RuntimeError, Variable,
 };
 use rdkafka::Message;
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
+
+use crate::{writer::CanExtractPartition, MessageDeserializationError, MessageDeserializer};
+
+
+trait MessageTransformer<T: Serialize + CanExtractPartition + Clone> {
+    async fn transform<M: Message + Send + Sync>(&mut self, kafka_message: &M) -> Result<Vec<T>, TransformError>;
+}
+
+pub struct ExistingTransformer {
+    message_deserializer: Box<dyn MessageDeserializer + Send>,
+    transforms: Transformer,
+}
+
+impl ExistingTransformer {
+    async fn deserialize_message<M>(
+        &mut self,
+        msg: &M,
+    ) -> Result<Value, MessageDeserializationError>
+    where
+        M: Message + Send + Sync,
+    {
+        let message_bytes = match msg.payload() {
+            Some(b) => b,
+            None => return Err(MessageDeserializationError::EmptyPayload),
+        };
+
+        let value = self.message_deserializer.deserialize(message_bytes).await?;
+        // TODO: handle metrics
+        // self.ingest_metrics
+        //     .message_deserialized_size(message_bytes.len());
+        Ok(value)
+    }
+}
+
+impl MessageTransformer<Value> for ExistingTransformer {
+    async fn transform<M: Message + Send + Sync>(&mut self, kafka_message: &M) -> Result<Vec<Value>, TransformError> {
+        // TODO: deal with unwrap by consolidating error types
+        let mut value = self.deserialize_message(kafka_message).await.unwrap();
+        self.transforms.transform(&mut value, Some(kafka_message))?;
+        Ok(vec![value])
+    }
+}
 
 /// Error thrown by [`Transformer`].
 #[derive(thiserror::Error, Debug)]
