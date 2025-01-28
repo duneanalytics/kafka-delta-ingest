@@ -1,9 +1,11 @@
+//! TODO document
 use crate::{DataTypeOffset, DataTypePartition};
 use deltalake_core::kernel::{Action, Add, Transaction};
 use deltalake_core::{DeltaTable, DeltaTableError};
 use std::collections::HashMap;
 
-pub(crate) async fn load_table(
+/// TODO document
+pub async fn load_table(
     table_uri: &str,
     options: HashMap<String, String>,
 ) -> Result<DeltaTable, DeltaTableError> {

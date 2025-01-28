@@ -1,3 +1,4 @@
+//! TODO doc
 use crate::transforms::Transformer;
 use async_trait::async_trait;
 use chrono::prelude::*;
@@ -40,7 +41,7 @@ pub struct DeadLetter {
 impl DeadLetter {
     /// Creates a dead letter from bytes that failed deserialization.
     /// `json_string` will always be `None`.
-    pub(crate) fn from_failed_deserialization(bytes: &[u8], err: String) -> Self {
+    pub fn from_failed_deserialization(bytes: &[u8], err: String) -> Self {
         let timestamp = Utc::now();
         Self {
             base64_bytes: Some(base64::encode(bytes)),
@@ -55,7 +56,7 @@ impl DeadLetter {
 
     /// Creates a dead letter from a failed transform.
     /// `base64_bytes` will always be `None`.
-    pub(crate) fn from_failed_transform(value: &Value, err: TransformError) -> Self {
+    pub fn from_failed_transform(value: &Value, err: TransformError) -> Self {
         let timestamp = Utc::now();
         Self {
             base64_bytes: None,
@@ -102,6 +103,7 @@ pub enum DeadLetterQueueError {
     #[error("JSON serialization failed: {source}")]
     SerdeJson {
         #[from]
+        /// TODO document
         source: serde_json::Error,
     },
 
@@ -109,6 +111,7 @@ pub enum DeadLetterQueueError {
     #[error("Write failed: {source}")]
     Writer {
         #[from]
+        /// TODO document
         source: Box<DataWriterError>,
     },
 
@@ -116,6 +119,7 @@ pub enum DeadLetterQueueError {
     #[error("TransformError: {source}")]
     Transform {
         #[from]
+        /// TODO document
         source: TransformError,
     },
 
@@ -289,7 +293,7 @@ impl DeadLetterQueue for DeltaSinkDeadLetterQueue {
                     .map_err(|e| DeadLetterQueueError::SerdeJson { source: e })
                     .and_then(|mut v| {
                         self.transformer
-                            .transform(&mut v, None as Option<&BorrowedMessage>)?;
+                            .transform::<BorrowedMessage>(&mut v, None)?;
                         Ok(v)
                     })
             })

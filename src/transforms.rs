@@ -1,25 +1,137 @@
+//! TODO docs
 use chrono::prelude::*;
+use deltalake_core::kernel::StructType;
 use jmespatch::{
     functions::{ArgumentType, CustomFunction, Signature},
     Context, ErrorReason, Expression, JmespathError, Rcvar, Runtime, RuntimeError, Variable,
 };
 use rdkafka::Message;
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
+
+use crate::{
+    coercions, dead_letters::DeadLetter, writer::CanExtractPartition, CoercionTree,
+    MessageDeserializationError, MessageDeserializer,
+};
+
+/// TODO Needs to be documented
+pub type ValuesFromSingleMessage<T> = Vec<T>;
+
+/// TODO Needs to be documented
+pub struct MessageTransformerError {
+    /// TODO Needs to be documented
+    pub maybe_dead_letter: Option<DeadLetter>,
+    /// TODO Needs to be documented
+    pub error: TransformOrDeserializationError,
+}
+
+/// TODO Needs to be documented
+pub enum TransformOrDeserializationError {
+    /// TODO Needs to be documented
+    Transform,
+    /// TODO Needs to be documented
+    Deserialization,
+}
+
+/// TODO Needs to be documented
+pub trait MessageTransformer<T: Serialize + CanExtractPartition + Clone> {
+    /// TODO Needs to be documented
+    fn transform<M: Message + Send + Sync>(
+        &mut self,
+        kafka_message: &M,
+    ) -> impl std::future::Future<Output = Result<ValuesFromSingleMessage<T>, MessageTransformerError>>
+           + Send;
+    /// TODO Needs to be documented
+    fn on_schema_change(&mut self, _: &StructType) {}
+}
+
+pub(crate) struct ExistingTransformer {
+    pub message_deserializer: Box<dyn MessageDeserializer + Send>,
+    pub transforms: Transformer,
+    pub coercion_tree: CoercionTree,
+}
+
+impl ExistingTransformer {
+    async fn deserialize_message<M>(
+        &mut self,
+        msg: &M,
+    ) -> Result<Value, MessageDeserializationError>
+    where
+        M: Message + Send + Sync,
+    {
+        let message_bytes = match msg.payload() {
+            Some(b) => b,
+            None => return Err(MessageDeserializationError::EmptyPayload),
+        };
+
+        let value = self.message_deserializer.deserialize(message_bytes).await?;
+        // TODO: handle metrics
+        // self.ingest_metrics
+        //     .message_deserialized_size(message_bytes.len());
+        Ok(value)
+    }
+}
+
+impl MessageTransformer<Value> for ExistingTransformer {
+    async fn transform<M: Message + Send + Sync>(
+        &mut self,
+        kafka_message: &M,
+    ) -> Result<Vec<Value>, MessageTransformerError> {
+        // TODO: deal with unwrap by consolidating error types
+        let mut value = match self.deserialize_message(kafka_message).await {
+            Ok(v) => v,
+            Err(MessageDeserializationError::EmptyPayload) => {
+                return Err(MessageTransformerError {
+                    maybe_dead_letter: None,
+                    error: TransformOrDeserializationError::Deserialization,
+                });
+            }
+            Err(
+                MessageDeserializationError::JsonDeserialization { dead_letter }
+                | MessageDeserializationError::AvroDeserialization { dead_letter },
+            ) => {
+                return Err(MessageTransformerError {
+                    maybe_dead_letter: Some(dead_letter),
+                    error: TransformOrDeserializationError::Deserialization,
+                });
+            }
+        };
+
+        // Trasnform the value
+        self.transforms
+            .transform(&mut value, Some(kafka_message))
+            .map_err(|e| MessageTransformerError {
+                maybe_dead_letter: Some(DeadLetter::from_failed_transform(&value, e)),
+                error: TransformOrDeserializationError::Transform,
+            })?;
+        // Coerce data types
+        coercions::coerce(&mut value, &self.coercion_tree);
+        Ok(vec![value])
+    }
+    fn on_schema_change(&mut self, schema: &StructType) {
+        let coercion_tree = coercions::create_coercion_tree(schema);
+        let _ = std::mem::replace(&mut self.coercion_tree, coercion_tree);
+    }
+}
 
 /// Error thrown by [`Transformer`].
 #[derive(thiserror::Error, Debug)]
 pub enum TransformError {
     /// The value to transform is not a JSON object.
     #[error("Unable to mutate non-object value {value}")]
-    ValueNotAnObject { value: Value },
+    ValueNotAnObject {
+        /// TODO Needs to be documented
+        value: Value,
+    },
 
     /// JMESPath query expression failed when querying the source value.
     #[error("JmespathError: {source}")]
     JmesPath {
         #[from]
+        /// TODO Needs to be documented
         source: JmespathError,
     },
 
@@ -27,6 +139,7 @@ pub enum TransformError {
     #[error("serde_json::Error: {source}")]
     Json {
         #[from]
+        /// TODO Needs to be documented
         source: serde_json::Error,
     },
 }
