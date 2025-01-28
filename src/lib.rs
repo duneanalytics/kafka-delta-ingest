@@ -30,6 +30,7 @@ use rdkafka::{
     util::Timeout,
     ClientContext, Message, Offset, TopicPartitionList,
 };
+use serde::Serialize;
 use serde_json::Value;
 use serialization::{MessageDeserializer, MessageDeserializerFactory};
 use std::sync::Arc;
@@ -38,16 +39,17 @@ use std::{collections::HashMap, path::PathBuf};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use writer::CanExtractPartition;
 
 mod coercions;
 /// Doc
 pub mod cursor;
-mod dead_letters;
-mod delta_helpers;
+pub mod dead_letters;
+pub mod delta_helpers;
 mod metrics;
 mod offsets;
 mod serialization;
-mod transforms;
+pub mod transforms;
 mod value_buffers;
 /// Doc
 pub mod writer;
@@ -322,16 +324,21 @@ impl Default for IngestOptions {
     }
 }
 
-/// Executes a run loop to consume from a Kafka topic and write to a Delta table.
-pub async fn start_ingest(
+/// TODO Needs to be documented
+pub async fn start_ingest_custom_transform<
+    T: Serialize + CanExtractPartition + Clone,
+    F: transforms::MessageTransformer<T>,
+>(
     topic: String,
-    table_uri: String,
+    table: DeltaTable,
     opts: IngestOptions,
     cancellation_token: Arc<CancellationToken>,
+    transformer: F,
 ) -> Result<(), IngestError> {
     info!(
         "Ingesting messages from {} Kafka topic to {} Delta table",
-        topic, table_uri
+        topic,
+        table.table_uri()
     );
     info!("Using options: [allowed_latency={},max_messages_per_batch={},min_bytes_per_file={},write_checkpoints={}]",
         opts.allowed_latency,
@@ -368,10 +375,11 @@ pub async fn start_ingest(
     // Initialize the processor
     let mut ingest_processor = IngestProcessor::new(
         topic.clone(),
-        table_uri.as_str(),
+        table,
         consumer.clone(),
         opts,
         ingest_metrics.clone(),
+        transformer,
     )
     .await?;
 
@@ -523,6 +531,32 @@ pub async fn start_ingest(
     }
 }
 
+/// Executes a run loop to consume from a Kafka topic and write to a Delta table.
+pub async fn start_ingest(
+    topic: String,
+    table_uri: String,
+    opts: IngestOptions,
+    cancellation_token: Arc<CancellationToken>,
+) -> Result<(), IngestError> {
+    let transformer = Transformer::from_transforms(&opts.transforms)?;
+    let table = delta_helpers::load_table(table_uri.as_str(), HashMap::new()).await?;
+    let coercion_tree = coercions::create_coercion_tree(table.schema().unwrap());
+    let deserializer =
+        match MessageDeserializerFactory::try_build(&opts.input_format, opts.decompress_gzip) {
+            Ok(deserializer) => deserializer,
+            Err(e) => return Err(IngestError::UnableToCreateDeserializer { source: e }),
+        };
+
+    let existing_transformer = ExistingTransformer {
+        coercion_tree,
+        message_deserializer: deserializer,
+        transforms: transformer,
+    };
+
+    start_ingest_custom_transform(topic, table, opts, cancellation_token, existing_transformer)
+        .await
+}
+
 fn end_of_partition_reached(
     message: &BorrowedMessage,
     offset_map: &HashMap<DataTypePartition, DataTypeOffset>,
@@ -596,10 +630,13 @@ fn fetch_latest_offsets(
 /// Writing a new rebalance signal is implemented in [`KafkaContext`].
 /// When handling a signal, we take out a read lock first to avoid starving the write lock.
 /// If a signal exists and indicates a new partition assignment, we take out a write lock so we can clear it after resetting state.
-async fn handle_rebalance(
+async fn handle_rebalance<
+    T: Serialize + CanExtractPartition + Clone,
+    F: transforms::MessageTransformer<T>,
+>(
     rebalance_signal: Arc<RwLock<Option<RebalanceSignal>>>,
     partition_assignment: &mut PartitionAssignment,
-    processor: &mut IngestProcessor,
+    processor: &mut IngestProcessor<T, F>,
 ) -> Result<(), IngestError> {
     // step 1 - use a read lock so we don't starve the write lock from `KafkaContext` to check if a rebalance signal exists.
     // if there is a rebalance assign signal - in step 2, we grab a write lock so we can reset state and clear signal.
@@ -730,56 +767,56 @@ enum RebalanceAction {
 }
 
 /// Holds state and encapsulates functionality required to process messages and write to delta.
-struct IngestProcessor {
+struct IngestProcessor<T, F>
+where
+    T: Serialize + CanExtractPartition + Clone,
+    F: transforms::MessageTransformer<T>,
+{
     topic: String,
     consumer: Arc<StreamConsumer<KafkaContext>>,
-    transformer: Transformer,
-    coercion_tree: CoercionTree,
+    // transformer: Transformer,
+    // coercion_tree: CoercionTree,
     table: DeltaTable,
     delta_writer: DataWriter,
-    value_buffers: ValueBuffers,
+    value_buffers: ValueBuffers<T>,
     delta_partition_offsets: HashMap<DataTypePartition, Option<DataTypeOffset>>,
     latency_timer: Instant,
     dlq: Box<dyn DeadLetterQueue>,
     opts: IngestOptions,
     ingest_metrics: IngestMetrics,
-    message_deserializer: Box<dyn MessageDeserializer + Send>,
+    // message_deserializer: Box<dyn MessageDeserializer + Send>,
+    message_transformer: F,
 }
 
-impl IngestProcessor {
+impl<T, F> IngestProcessor<T, F>
+where
+    T: Serialize + CanExtractPartition + Clone,
+    F: transforms::MessageTransformer<T>,
+{
     /// Creates a new ingest [`IngestProcessor`].
     async fn new(
         topic: String,
-        table_uri: &str,
+        table: DeltaTable,
         consumer: Arc<StreamConsumer<KafkaContext>>,
         opts: IngestOptions,
         ingest_metrics: IngestMetrics,
-    ) -> Result<IngestProcessor, IngestError> {
+        message_transformer: F,
+    ) -> Result<IngestProcessor<T, F>, IngestError> {
         let dlq = dead_letter_queue_from_options(&opts).await?;
-        let transformer = Transformer::from_transforms(&opts.transforms)?;
-        let table = delta_helpers::load_table(table_uri, HashMap::new()).await?;
-        let coercion_tree = coercions::create_coercion_tree(table.schema().unwrap());
         let delta_writer = DataWriter::for_table(&table, HashMap::new())?;
-        let deserializer =
-            match MessageDeserializerFactory::try_build(&opts.input_format, opts.decompress_gzip) {
-                Ok(deserializer) => deserializer,
-                Err(e) => return Err(IngestError::UnableToCreateDeserializer { source: e }),
-            };
 
         Ok(IngestProcessor {
             topic,
             consumer,
-            transformer,
-            coercion_tree,
             table,
             delta_writer,
-            value_buffers: ValueBuffers::default(),
+            value_buffers: ValueBuffers::<T>::default(),
             latency_timer: Instant::now(),
             delta_partition_offsets: HashMap::new(),
             dlq,
             opts,
             ingest_metrics,
-            message_deserializer: deserializer,
+            message_transformer,
         })
     }
 
@@ -817,72 +854,52 @@ impl IngestProcessor {
             return Err(IngestError::AlreadyProcessedPartitionOffset { partition, offset });
         }
 
-        // Deserialize
-        match self.deserialize_message(&message).await {
-            Ok(mut value) => {
+        // Deserialize and transform
+        match self.message_transformer.transform(&message).await {
+            Ok(values) => {
+                if let Some(p) = message.payload() {
+                    self.ingest_metrics.message_deserialized_size(p.len());
+                };
                 self.ingest_metrics.message_deserialized();
-                // Transform
-                match self.transformer.transform(&mut value, Some(&message)) {
-                    Ok(()) => {
-                        self.ingest_metrics.message_transformed();
-                        // Coerce data types
-                        coercions::coerce(&mut value, &self.coercion_tree);
-                        // Buffer
-                        self.value_buffers.add(partition, offset, value)?;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Transform failed - partition {}, offset {}",
-                            partition, offset
-                        );
-                        self.ingest_metrics.message_transform_failed();
-                        self.dlq
-                            .write_dead_letter(DeadLetter::from_failed_transform(&value, e))
-                            .await?;
-                    }
-                }
+                self.ingest_metrics.message_transformed();
+                self.value_buffers.add(partition, offset, values)?;
             }
-            Err(MessageDeserializationError::EmptyPayload) => {
+            Err(transforms::MessageTransformerError {
+                maybe_dead_letter,
+                error: transforms::TransformOrDeserializationError::Transform,
+            }) => {
                 warn!(
-                    "Empty payload for message - partition {}, offset {}",
+                    "Transform failed - partition {}, offset {}",
                     partition, offset
                 );
+                self.ingest_metrics.message_transform_failed();
+                if let Some(dead_letter) = maybe_dead_letter {
+                    self.dlq.write_dead_letter(dead_letter).await?;
+                };
             }
-            Err(
-                MessageDeserializationError::JsonDeserialization { dead_letter }
-                | MessageDeserializationError::AvroDeserialization { dead_letter },
-            ) => {
-                warn!(
-                    "Deserialization failed - partition {}, offset {}, dead_letter {}",
-                    partition,
-                    offset,
-                    dead_letter.error.as_ref().unwrap_or(&String::from("_")),
-                );
-                self.ingest_metrics.message_deserialization_failed();
-                self.dlq.write_dead_letter(dead_letter).await?;
+            Err(transforms::MessageTransformerError {
+                maybe_dead_letter,
+                error: transforms::TransformOrDeserializationError::Deserialization,
+            }) => {
+                if let Some(dead_letter) = maybe_dead_letter {
+                    warn!(
+                        "Deserialization failed - partition {}, offset {}, dead_letter {}",
+                        partition,
+                        offset,
+                        dead_letter.error.as_ref().unwrap_or(&String::from("_")),
+                    );
+                    self.ingest_metrics.message_deserialization_failed();
+                    self.dlq.write_dead_letter(dead_letter).await?;
+                } else {
+                    warn!(
+                        "Empty payload for message - partition {}, offset {}",
+                        partition, offset
+                    );
+                }
             }
         }
 
         Ok(())
-    }
-
-    /// Deserializes a message received from Kafka
-    async fn deserialize_message<M>(
-        &mut self,
-        msg: &M,
-    ) -> Result<Value, MessageDeserializationError>
-    where
-        M: Message + Send + Sync,
-    {
-        let message_bytes = match msg.payload() {
-            Some(b) => b,
-            None => return Err(MessageDeserializationError::EmptyPayload),
-        };
-
-        let value = self.message_deserializer.deserialize(message_bytes).await?;
-        self.ingest_metrics
-            .message_deserialized_size(message_bytes.len());
-        Ok(value)
     }
 
     /// Writes the transformed messages currently held in buffer to parquet byte buffers.
@@ -954,8 +971,8 @@ impl IngestProcessor {
         if self.delta_writer.update_schema(&self.table)? {
             info!("Table schema has been updated");
             // Update the coercion tree to reflect the new schema
-            let coercion_tree = coercions::create_coercion_tree(self.table.schema().unwrap());
-            let _ = std::mem::replace(&mut self.coercion_tree, coercion_tree);
+            self.message_transformer
+                .on_schema_change(&self.table.schema().unwrap());
 
             return Err(IngestError::DeltaSchemaChanged);
         }

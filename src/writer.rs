@@ -9,7 +9,6 @@ use deltalake_core::arrow::{
     datatypes::Schema as ArrowSchema,
     datatypes::*,
     error::ArrowError,
-    json::reader::ReaderBuilder,
     record_batch::*,
 };
 use deltalake_core::parquet::{
@@ -30,6 +29,7 @@ use deltalake_core::{
 };
 use deltalake_core::{operations::transaction::TableReference, parquet::format::FileMetaData};
 use log::{error, info, warn};
+use serde::Serialize;
 use serde_json::{Number, Value};
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::cursor::InMemoryWriteableCursor;
+use crate::{cursor::InMemoryWriteableCursor, transforms::ValuesFromSingleMessage};
 
 const NULL_PARTITION_VALUE_DATA_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
 
@@ -48,6 +48,21 @@ type MinAndMaxValues = (
 );
 
 type NullCounts = HashMap<String, ColumnCountStat>;
+
+/// This needs to be documented!
+pub trait CanExtractPartition {
+    /// Document we rely on ordering
+    fn partition_value_based_on_key(&self, field_names: &[String]) -> Vec<String>;
+}
+
+impl CanExtractPartition for Value {
+    fn partition_value_based_on_key(&self, field_names: &[String]) -> Vec<String> {
+        field_names
+            .into_iter()
+            .map(|field_name| self.get(field_name).unwrap_or(&Value::Null).to_string())
+            .collect()
+    }
+}
 
 /// Enum representing an error when calling [`DataWriter`].
 #[derive(thiserror::Error, Debug)]
@@ -192,13 +207,15 @@ pub(crate) struct DataArrowWriter {
 impl DataArrowWriter {
     /// Writes the given JSON buffer and updates internal state accordingly.
     /// This method buffers the write stream internally so it can be invoked for many json buffers and flushed after the appropriate number of bytes has been written.
-    async fn write_values(
+    async fn write_values<T: Serialize + Clone>(
         &mut self,
         partition_columns: &[String],
         arrow_schema: Arc<ArrowSchema>,
-        json_buffer: Vec<Value>,
+        buffer: Vec<Vec<T>>,
     ) -> Result<(), Box<DataWriterError>> {
-        let record_batch = record_batch_from_json(arrow_schema.clone(), json_buffer.as_slice())?;
+        let flattened_buffer = buffer.iter().flatten().collect::<Vec<&T>>();
+        let record_batch =
+            record_batch_from_json(arrow_schema.clone(), flattened_buffer.as_slice())?;
 
         if record_batch.schema() != arrow_schema {
             return Err(Box::new(DataWriterError::SchemaMismatch {
@@ -214,7 +231,7 @@ impl DataArrowWriter {
         match result {
             Err(e) => match *e {
                 DataWriterError::Parquet { source } => {
-                    self.write_partial(partition_columns, arrow_schema, json_buffer, source)
+                    self.write_partial(partition_columns, arrow_schema, buffer, source)
                         .await
                 }
                 _ => Err(e),
@@ -223,11 +240,11 @@ impl DataArrowWriter {
         }
     }
 
-    async fn write_partial(
+    async fn write_partial<T: Serialize + Clone>(
         &mut self,
         partition_columns: &[String],
         arrow_schema: Arc<ArrowSchema>,
-        json_buffer: Vec<Value>,
+        json_buffer: Vec<Vec<T>>,
         parquet_error: ParquetError,
     ) -> Result<(), Box<DataWriterError>> {
         warn!("Failed with parquet error while writing record batch. Attempting quarantine of bad records.");
@@ -240,8 +257,12 @@ impl DataArrowWriter {
             good.len(),
             bad.len()
         );
+        let bads = bad
+            .into_iter()
+            .map(|(v, e)| (serde_json::to_value(v).unwrap(), e))
+            .collect();
         Err(Box::new(DataWriterError::PartialParquetWrite {
-            skipped_values: bad,
+            skipped_values: bads,
             sample_error: parquet_error,
         }))
     }
@@ -386,11 +407,30 @@ impl DataWriter {
     }
 
     /// Writes the given values to internal parquet buffers for each represented partition.
-    pub async fn write(&mut self, values: Vec<Value>) -> Result<(), Box<DataWriterError>> {
+    pub async fn write<T: Serialize + CanExtractPartition + Clone>(
+        &mut self,
+        values: Vec<ValuesFromSingleMessage<T>>,
+    ) -> Result<(), Box<DataWriterError>> {
         let mut partial_writes: Vec<(Value, ParquetError)> = Vec::new();
         let arrow_schema = self.arrow_schema();
 
-        for (key, values) in self.divide_by_partition_values(values)? {
+        let mut res: HashMap<String, Vec<ValuesFromSingleMessage<T>>> = HashMap::new();
+        for single_message_values in values {
+            let r: HashMap<String, Vec<T>> =
+                self.divide_by_partition_values(single_message_values)?;
+            if r.len() > 1 {
+                // TODO
+                // Proper error. We have to check that all elements of a ValuesFromSingleMessage must belong to the same target partition.
+                // This is done to guarantee that we either fail the whole Kafka message or succeed.
+                return Err(Box::new(DataWriterError::MissingPartitionColumn(
+                    "".to_string(),
+                )));
+            }
+            for (k, v) in r {
+                res.entry(k).or_insert_with(Vec::new).push(v);
+            }
+        }
+        for (key, values) in res {
             match self.arrow_writers.get_mut(&key) {
                 Some(writer) => collect_partial_write_failure(
                     &mut partial_writes,
@@ -541,11 +581,11 @@ impl DataWriter {
         Ok(data_path)
     }
 
-    fn divide_by_partition_values(
+    fn divide_by_partition_values<T: CanExtractPartition>(
         &self,
-        records: Vec<Value>,
-    ) -> Result<HashMap<String, Vec<Value>>, Box<DataWriterError>> {
-        let mut partitioned_records: HashMap<String, Vec<Value>> = HashMap::new();
+        records: Vec<T>,
+    ) -> Result<HashMap<String, Vec<T>>, Box<DataWriterError>> {
+        let mut partitioned_records: HashMap<String, Vec<T>> = HashMap::new();
 
         for record in records {
             let partition_value = self.json_to_partition_values(&record)?;
@@ -560,17 +600,13 @@ impl DataWriter {
         Ok(partitioned_records)
     }
 
-    fn json_to_partition_values(&self, value: &Value) -> Result<String, Box<DataWriterError>> {
-        if let Some(obj) = value.as_object() {
-            let key: Vec<String> = self
-                .partition_columns
-                .iter()
-                .map(|c| obj.get(c).unwrap_or(&Value::Null).to_string())
-                .collect();
-            return Ok(key.join("/"));
-        }
-
-        Err(Box::new(DataWriterError::InvalidRecord(value.to_string())))
+    fn json_to_partition_values<T: CanExtractPartition>(
+        &self,
+        value: &T,
+    ) -> Result<String, Box<DataWriterError>> {
+        Ok(value
+            .partition_value_based_on_key(&self.partition_columns)
+            .join("/"))
     }
 
     /// Inserts the given values immediately into the delta table.
@@ -580,7 +616,8 @@ impl DataWriter {
         table: &mut DeltaTable,
         values: Vec<Value>,
     ) -> Result<i64, Box<DataWriterError>> {
-        self.write(values).await?;
+        self.write(values.into_iter().map(|v| vec![v]).collect())
+            .await?;
         let mut adds = self.write_parquet_files(&table.table_uri()).await?;
         let actions = adds.drain(..).map(Action::Add).collect();
         let commit = deltalake_core::operations::transaction::CommitBuilder::default()
@@ -601,25 +638,25 @@ impl DataWriter {
 }
 
 /// Creates an Arrow RecordBatch from the passed JSON buffer.
-pub fn record_batch_from_json(
-    arrow_schema: Arc<ArrowSchema>,
-    json: &[Value],
-) -> Result<RecordBatch, Box<DataWriterError>> {
-    let mut decoder = ReaderBuilder::new(arrow_schema).build_decoder()?;
-    decoder.serialize(json)?;
-    decoder
-        .flush()?
-        .ok_or(Box::new(DataWriterError::EmptyRecordBatch))
+pub fn record_batch_from_json<T: Serialize>(arrow_schema: Arc<ArrowSchema>, items: &[T]) -> Result<RecordBatch, Box<DataWriterError>> {
+    let fields = arrow_schema.fields();
+    let builder = serde_arrow::ArrayBuilder::from_arrow(fields).unwrap();
+    items
+        .serialize(serde_arrow::Serializer::new(builder))
+        .unwrap()
+        .into_inner()
+        .to_record_batch()
+        .map_err(|_| Box::new(DataWriterError::EmptyRecordBatch))
 }
 
-type BadValue = (Value, ParquetError);
+type BadValue<T> = (T, ParquetError);
 
-fn quarantine_failed_parquet_rows(
+fn quarantine_failed_parquet_rows<T: Serialize + Clone>(
     arrow_schema: Arc<ArrowSchema>,
-    values: Vec<Value>,
-) -> Result<(Vec<Value>, Vec<BadValue>), Box<DataWriterError>> {
-    let mut good: Vec<Value> = Vec::new();
-    let mut bad: Vec<BadValue> = Vec::new();
+    values: Vec<T>,
+) -> Result<(Vec<T>, Vec<BadValue<T>>), Box<DataWriterError>> {
+    let mut good: Vec<T> = Vec::new();
+    let mut bad: Vec<BadValue<T>> = Vec::new();
 
     for value in values {
         let record_batch = record_batch_from_json(arrow_schema.clone(), &[value.clone()])?;
@@ -651,6 +688,13 @@ fn collect_partial_write_failure(
         _ => writer_result,
     }
 }
+
+// fn get_field_as_value<T: Serialize>(instance: &T, field_name: &str) -> Option<Value> {
+//     // Serialize the instance into a JSON Value
+//     let serialized = serde_json::to_value(instance).ok()?;
+//     // Get the specific field by its name
+//     serialized.get(field_name).cloned()
+// }
 
 fn min_max_values_from_file_metadata(
     partition_values: &HashMap<String, Option<String>>,
@@ -1161,7 +1205,10 @@ mod tests {
             .unwrap();
         let mut writer = DataWriter::for_table(&table, HashMap::new()).unwrap();
 
-        writer.write(JSON_ROWS.clone()).await.unwrap();
+        writer
+            .write(JSON_ROWS.clone().into_iter().map(|v| vec![v]).collect())
+            .await
+            .unwrap();
         let add = writer
             .write_parquet_files(&table.table_uri())
             .await
