@@ -289,7 +289,7 @@ impl DeadLetterQueue for DeltaSinkDeadLetterQueue {
                     .map_err(|e| DeadLetterQueueError::SerdeJson { source: e })
                     .and_then(|mut v| {
                         self.transformer
-                            .transform(&mut v, None as Option<&BorrowedMessage>)?;
+                            .transform::<BorrowedMessage>(&mut v, None)?;
                         Ok(v)
                     })
             })

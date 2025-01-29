@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use serde::Serialize;
 
-use crate::cursor::InMemoryWriteableCursor;
+use crate::{cursor::InMemoryWriteableCursor, transforms::ValuesFromSingleMessage};
 
 const NULL_PARTITION_VALUE_DATA_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
 
@@ -211,9 +211,10 @@ impl DataArrowWriter {
         &mut self,
         partition_columns: &[String],
         arrow_schema: Arc<ArrowSchema>,
-        json_buffer: Vec<T>,
+        buffer: Vec<Vec<T>>,
     ) -> Result<(), Box<DataWriterError>> {
-        let record_batch = record_batch_from_json(arrow_schema.clone(), json_buffer.as_slice())?;
+        let flattened_buffer = buffer.iter().flatten().collect::<Vec<&T>>();
+        let record_batch = record_batch_from_json(arrow_schema.clone(), flattened_buffer.as_slice())?;
 
         if record_batch.schema() != arrow_schema {
             return Err(Box::new(DataWriterError::SchemaMismatch {
@@ -229,7 +230,7 @@ impl DataArrowWriter {
         match result {
             Err(e) => match *e {
                 DataWriterError::Parquet { source } => {
-                    self.write_partial(partition_columns, arrow_schema, json_buffer, source)
+                    self.write_partial(partition_columns, arrow_schema, buffer, source)
                         .await
                 }
                 _ => Err(e),
@@ -242,7 +243,7 @@ impl DataArrowWriter {
         &mut self,
         partition_columns: &[String],
         arrow_schema: Arc<ArrowSchema>,
-        json_buffer: Vec<T>,
+        json_buffer: Vec<Vec<T>>,
         parquet_error: ParquetError,
     ) -> Result<(), Box<DataWriterError>> {
         warn!("Failed with parquet error while writing record batch. Attempting quarantine of bad records.");
@@ -402,11 +403,24 @@ impl DataWriter {
     }
 
     /// Writes the given values to internal parquet buffers for each represented partition.
-    pub async fn write<T: Serialize + CanExtractPartition + Clone>(&mut self, values: Vec<T>) -> Result<(), Box<DataWriterError>> {
+    pub async fn write<T: Serialize + CanExtractPartition + Clone>(&mut self, values: Vec<ValuesFromSingleMessage<T>>) -> Result<(), Box<DataWriterError>> {
         let mut partial_writes: Vec<(Value, ParquetError)> = Vec::new();
         let arrow_schema = self.arrow_schema();
 
-        for (key, values) in self.divide_by_partition_values(values)? {
+        let mut res: HashMap<String, Vec<ValuesFromSingleMessage<T>>> = HashMap::new();
+        for single_message_values in values {
+            let r: HashMap<String, Vec<T>> = self.divide_by_partition_values(single_message_values)?;
+            if r.len() >  1 {
+                // TODO
+                // Proper error. We have to check that all elements of a ValuesFromSingleMessage must belong to the same target partition.
+                // This is done to guarantee that we either fail the whole Kafka message or succeed.
+                return Err(Box::new(DataWriterError::MissingPartitionColumn("".to_string())));
+            }
+            for (k, v) in r {
+                res.entry(k).or_insert_with(Vec::new).push(v);
+            }
+        } 
+        for (key, values) in res {
             match self.arrow_writers.get_mut(&key) {
                 Some(writer) => collect_partial_write_failure(
                     &mut partial_writes,
@@ -587,7 +601,7 @@ impl DataWriter {
         table: &mut DeltaTable,
         values: Vec<Value>,
     ) -> Result<i64, Box<DataWriterError>> {
-        self.write(values).await?;
+    self.write(values.into_iter().map(|v| vec![v]).collect()).await?;
         let mut adds = self.write_parquet_files(&table.table_uri()).await?;
         let actions = adds.drain(..).map(Action::Add).collect();
         let commit = deltalake_core::operations::transaction::CommitBuilder::default()
