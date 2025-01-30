@@ -16,23 +16,27 @@ use crate::{
     MessageDeserializationError, MessageDeserializer,
 };
 
+/// TODO Needs to be documented
 pub type ValuesFromSingleMessage<T> = Vec<T>;
 
+/// TODO Needs to be documented
 pub struct MessageTransformerError {
     pub maybe_dead_letter: Option<DeadLetter>,
     pub error: TransformOrDeserializationError,
 }
 
+/// TODO Needs to be documented
 pub enum TransformOrDeserializationError {
     Transform,
     Deserialization,
 }
 
 pub trait MessageTransformer<T: Serialize + CanExtractPartition + Clone> {
-    async fn transform<M: Message + Send + Sync>(
+    fn transform<M: Message + Send + Sync>(
         &mut self,
         kafka_message: &M,
-    ) -> Result<ValuesFromSingleMessage<T>, MessageTransformerError>;
+    ) -> impl std::future::Future<Output = Result<ValuesFromSingleMessage<T>, MessageTransformerError>>
+           + Send;
     fn on_schema_change(&mut self, _: &StructType) {}
 }
 

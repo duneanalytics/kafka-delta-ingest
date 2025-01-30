@@ -324,16 +324,21 @@ impl Default for IngestOptions {
     }
 }
 
-/// Executes a run loop to consume from a Kafka topic and write to a Delta table.
-pub async fn start_ingest(
+/// TODO Needs to be documented
+pub async fn start_ingest_custom_transform<
+    T: Serialize + CanExtractPartition + Clone,
+    F: transforms::MessageTransformer<T>,
+>(
     topic: String,
-    table_uri: String,
+    table: DeltaTable,
     opts: IngestOptions,
     cancellation_token: Arc<CancellationToken>,
+    transformer: F,
 ) -> Result<(), IngestError> {
     info!(
         "Ingesting messages from {} Kafka topic to {} Delta table",
-        topic, table_uri
+        topic,
+        table.table_uri()
     );
     info!("Using options: [allowed_latency={},max_messages_per_batch={},min_bytes_per_file={},write_checkpoints={}]",
         opts.allowed_latency,
@@ -367,22 +372,6 @@ pub async fn start_ingest(
     let ingest_metrics = IngestMetrics::new(opts.statsd_endpoint.as_str())?;
     // Initialize partition assignment tracking
     let mut partition_assignment = PartitionAssignment::default();
-
-    let transformer = Transformer::from_transforms(&opts.transforms)?;
-    let table = delta_helpers::load_table(table_uri.as_str(), HashMap::new()).await?;
-    let coercion_tree = coercions::create_coercion_tree(table.schema().unwrap());
-    let deserializer =
-        match MessageDeserializerFactory::try_build(&opts.input_format, opts.decompress_gzip) {
-            Ok(deserializer) => deserializer,
-            Err(e) => return Err(IngestError::UnableToCreateDeserializer { source: e }),
-        };
-
-    let existing_transformer = ExistingTransformer {
-        coercion_tree,
-        message_deserializer: deserializer,
-        transforms: transformer,
-    };
-
     // Initialize the processor
     let mut ingest_processor = IngestProcessor::new(
         topic.clone(),
@@ -390,7 +379,7 @@ pub async fn start_ingest(
         consumer.clone(),
         opts,
         ingest_metrics.clone(),
-        existing_transformer,
+        transformer,
     )
     .await?;
 
@@ -540,6 +529,32 @@ pub async fn start_ingest(
             return Ok(());
         }
     }
+}
+
+/// Executes a run loop to consume from a Kafka topic and write to a Delta table.
+pub async fn start_ingest(
+    topic: String,
+    table_uri: String,
+    opts: IngestOptions,
+    cancellation_token: Arc<CancellationToken>,
+) -> Result<(), IngestError> {
+    let transformer = Transformer::from_transforms(&opts.transforms)?;
+    let table = delta_helpers::load_table(table_uri.as_str(), HashMap::new()).await?;
+    let coercion_tree = coercions::create_coercion_tree(table.schema().unwrap());
+    let deserializer =
+        match MessageDeserializerFactory::try_build(&opts.input_format, opts.decompress_gzip) {
+            Ok(deserializer) => deserializer,
+            Err(e) => return Err(IngestError::UnableToCreateDeserializer { source: e }),
+        };
+
+    let existing_transformer = ExistingTransformer {
+        coercion_tree,
+        message_deserializer: deserializer,
+        transforms: transformer,
+    };
+
+    start_ingest_custom_transform(topic, table, opts, cancellation_token, existing_transformer)
+        .await
 }
 
 fn end_of_partition_reached(

@@ -1206,7 +1206,10 @@ mod tests {
             .unwrap();
         let mut writer = DataWriter::for_table(&table, HashMap::new()).unwrap();
 
-        writer.write(JSON_ROWS.clone()).await.unwrap();
+        writer
+            .write(JSON_ROWS.clone().into_iter().map(|v| vec![v]).collect())
+            .await
+            .unwrap();
         let add = writer
             .write_parquet_files(&table.table_uri())
             .await
