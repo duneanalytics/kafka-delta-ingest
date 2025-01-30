@@ -11,7 +11,10 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
-use crate::{coercions, dead_letters::DeadLetter, writer::CanExtractPartition, CoercionTree, MessageDeserializationError, MessageDeserializer};
+use crate::{
+    coercions, dead_letters::DeadLetter, writer::CanExtractPartition, CoercionTree,
+    MessageDeserializationError, MessageDeserializer,
+};
 
 pub type ValuesFromSingleMessage<T> = Vec<T>;
 
@@ -26,7 +29,10 @@ pub enum TransformOrDeserializationError {
 }
 
 pub trait MessageTransformer<T: Serialize + CanExtractPartition + Clone> {
-    async fn transform<M: Message + Send + Sync>(&mut self, kafka_message: &M) -> Result<ValuesFromSingleMessage<T>, MessageTransformerError>;
+    async fn transform<M: Message + Send + Sync>(
+        &mut self,
+        kafka_message: &M,
+    ) -> Result<ValuesFromSingleMessage<T>, MessageTransformerError>;
     fn on_schema_change(&mut self, _: &StructType) {}
 }
 
@@ -58,7 +64,10 @@ impl ExistingTransformer {
 }
 
 impl MessageTransformer<Value> for ExistingTransformer {
-    async fn transform<M: Message + Send + Sync>(&mut self, kafka_message: &M) -> Result<Vec<Value>, MessageTransformerError> {
+    async fn transform<M: Message + Send + Sync>(
+        &mut self,
+        kafka_message: &M,
+    ) -> Result<Vec<Value>, MessageTransformerError> {
         // TODO: deal with unwrap by consolidating error types
         let mut value = match self.deserialize_message(kafka_message).await {
             Ok(v) => v,
@@ -78,12 +87,14 @@ impl MessageTransformer<Value> for ExistingTransformer {
                 });
             }
         };
-        
+
         // Trasnform the value
-        self.transforms.transform(&mut value, Some(kafka_message)).map_err(|e| MessageTransformerError {
-            maybe_dead_letter: Some(DeadLetter::from_failed_transform(&value, e)),
-            error: TransformOrDeserializationError::Transform,
-        })?;
+        self.transforms
+            .transform(&mut value, Some(kafka_message))
+            .map_err(|e| MessageTransformerError {
+                maybe_dead_letter: Some(DeadLetter::from_failed_transform(&value, e)),
+                error: TransformOrDeserializationError::Transform,
+            })?;
         // Coerce data types
         coercions::coerce(&mut value, &self.coercion_tree);
         Ok(vec![value])

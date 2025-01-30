@@ -1,4 +1,7 @@
-use crate::{transforms::ValuesFromSingleMessage, writer::CanExtractPartition, DataTypeOffset, DataTypePartition, IngestError};
+use crate::{
+    transforms::ValuesFromSingleMessage, writer::CanExtractPartition, DataTypeOffset,
+    DataTypePartition, IngestError,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -185,7 +188,11 @@ mod tests {
             }
         );
 
-        let mut values: Vec<String> = consumed.values.iter().flat_map(|v| v.iter().map(|j| j.to_string())).collect();
+        let mut values: Vec<String> = consumed
+            .values
+            .iter()
+            .flat_map(|v| v.iter().map(|j| j.to_string()))
+            .collect();
 
         values.sort();
 

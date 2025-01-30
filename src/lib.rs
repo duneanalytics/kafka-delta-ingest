@@ -33,13 +33,13 @@ use rdkafka::{
 use serde::Serialize;
 use serde_json::Value;
 use serialization::{MessageDeserializer, MessageDeserializerFactory};
-use writer::CanExtractPartition;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, path::PathBuf};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use writer::CanExtractPartition;
 
 mod coercions;
 /// Doc
@@ -376,7 +376,7 @@ pub async fn start_ingest(
             Ok(deserializer) => deserializer,
             Err(e) => return Err(IngestError::UnableToCreateDeserializer { source: e }),
         };
-    
+
     let existing_transformer = ExistingTransformer {
         coercion_tree,
         message_deserializer: deserializer,
@@ -615,7 +615,10 @@ fn fetch_latest_offsets(
 /// Writing a new rebalance signal is implemented in [`KafkaContext`].
 /// When handling a signal, we take out a read lock first to avoid starving the write lock.
 /// If a signal exists and indicates a new partition assignment, we take out a write lock so we can clear it after resetting state.
-async fn handle_rebalance<T: Serialize + CanExtractPartition + Clone, F: transforms::MessageTransformer<T>>(
+async fn handle_rebalance<
+    T: Serialize + CanExtractPartition + Clone,
+    F: transforms::MessageTransformer<T>,
+>(
     rebalance_signal: Arc<RwLock<Option<RebalanceSignal>>>,
     partition_assignment: &mut PartitionAssignment,
     processor: &mut IngestProcessor<T, F>,
@@ -839,11 +842,17 @@ where
         // Deserialize and transform
         match self.message_transformer.transform(&message).await {
             Ok(values) => {
+                if let Some(p) = message.payload() {
+                    self.ingest_metrics.message_deserialized_size(p.len());
+                };
                 self.ingest_metrics.message_deserialized();
                 self.ingest_metrics.message_transformed();
                 self.value_buffers.add(partition, offset, values)?;
-            },
-            Err(transforms::MessageTransformerError { maybe_dead_letter, error: transforms::TransformOrDeserializationError::Transform }) => {
+            }
+            Err(transforms::MessageTransformerError {
+                maybe_dead_letter,
+                error: transforms::TransformOrDeserializationError::Transform,
+            }) => {
                 warn!(
                     "Transform failed - partition {}, offset {}",
                     partition, offset
@@ -852,8 +861,11 @@ where
                 if let Some(dead_letter) = maybe_dead_letter {
                     self.dlq.write_dead_letter(dead_letter).await?;
                 };
-            },
-            Err(transforms::MessageTransformerError { maybe_dead_letter, error: transforms::TransformOrDeserializationError::Deserialization }) => {
+            }
+            Err(transforms::MessageTransformerError {
+                maybe_dead_letter,
+                error: transforms::TransformOrDeserializationError::Deserialization,
+            }) => {
                 if let Some(dead_letter) = maybe_dead_letter {
                     warn!(
                         "Deserialization failed - partition {}, offset {}, dead_letter {}",
@@ -872,28 +884,8 @@ where
             }
         }
 
-
         Ok(())
     }
-
-    /// Deserializes a message received from Kafka
-    // async fn deserialize_message<M>(
-    //     &mut self,
-    //     msg: &M,
-    // ) -> Result<Value, MessageDeserializationError>
-    // where
-    //     M: Message + Send + Sync,
-    // {
-    //     let message_bytes = match msg.payload() {
-    //         Some(b) => b,
-    //         None => return Err(MessageDeserializationError::EmptyPayload),
-    //     };
-
-    //     let value = self.message_deserializer.deserialize(message_bytes).await?;
-    //     self.ingest_metrics
-    //         .message_deserialized_size(message_bytes.len());
-    //     Ok(value)
-    // }
 
     /// Writes the transformed messages currently held in buffer to parquet byte buffers.
     async fn complete_record_batch(
@@ -909,7 +901,7 @@ where
 
         if values.is_empty() {
             return Ok(());
-        }   
+        }
 
         if let Err(e) = self.delta_writer.write(values).await {
             if let DataWriterError::PartialParquetWrite {
@@ -964,7 +956,8 @@ where
         if self.delta_writer.update_schema(&self.table)? {
             info!("Table schema has been updated");
             // Update the coercion tree to reflect the new schema
-            self.message_transformer.on_schema_change(&self.table.schema().unwrap());
+            self.message_transformer
+                .on_schema_change(&self.table.schema().unwrap());
 
             return Err(IngestError::DeltaSchemaChanged);
         }
