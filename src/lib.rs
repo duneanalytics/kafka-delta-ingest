@@ -45,11 +45,11 @@ mod coercions;
 /// Doc
 pub mod cursor;
 mod dead_letters;
-mod delta_helpers;
+pub mod delta_helpers;
 mod metrics;
 mod offsets;
 mod serialization;
-mod transforms;
+pub mod transforms;
 mod value_buffers;
 /// Doc
 pub mod writer;

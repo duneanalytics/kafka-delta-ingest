@@ -21,26 +21,33 @@ pub type ValuesFromSingleMessage<T> = Vec<T>;
 
 /// TODO Needs to be documented
 pub struct MessageTransformerError {
+    /// TODO Needs to be documented
     pub maybe_dead_letter: Option<DeadLetter>,
+    /// TODO Needs to be documented
     pub error: TransformOrDeserializationError,
 }
 
 /// TODO Needs to be documented
 pub enum TransformOrDeserializationError {
+    /// TODO Needs to be documented
     Transform,
+    /// TODO Needs to be documented
     Deserialization,
 }
 
+/// TODO Needs to be documented
 pub trait MessageTransformer<T: Serialize + CanExtractPartition + Clone> {
+    /// TODO Needs to be documented
     fn transform<M: Message + Send + Sync>(
         &mut self,
         kafka_message: &M,
     ) -> impl std::future::Future<Output = Result<ValuesFromSingleMessage<T>, MessageTransformerError>>
            + Send;
+    /// TODO Needs to be documented
     fn on_schema_change(&mut self, _: &StructType) {}
 }
 
-pub struct ExistingTransformer {
+pub(crate) struct ExistingTransformer {
     pub message_deserializer: Box<dyn MessageDeserializer + Send>,
     pub transforms: Transformer,
     pub coercion_tree: CoercionTree,
@@ -114,12 +121,16 @@ impl MessageTransformer<Value> for ExistingTransformer {
 pub enum TransformError {
     /// The value to transform is not a JSON object.
     #[error("Unable to mutate non-object value {value}")]
-    ValueNotAnObject { value: Value },
+    ValueNotAnObject {
+        /// TODO Needs to be documented
+        value: Value,
+    },
 
     /// JMESPath query expression failed when querying the source value.
     #[error("JmespathError: {source}")]
     JmesPath {
         #[from]
+        /// TODO Needs to be documented
         source: JmespathError,
     },
 
@@ -127,6 +138,7 @@ pub enum TransformError {
     #[error("serde_json::Error: {source}")]
     Json {
         #[from]
+        /// TODO Needs to be documented
         source: serde_json::Error,
     },
 }
