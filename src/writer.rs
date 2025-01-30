@@ -9,7 +9,6 @@ use deltalake_core::arrow::{
     datatypes::Schema as ArrowSchema,
     datatypes::*,
     error::ArrowError,
-    json::reader::ReaderBuilder,
     record_batch::*,
 };
 use deltalake_core::parquet::{
@@ -639,15 +638,15 @@ impl DataWriter {
 }
 
 /// Creates an Arrow RecordBatch from the passed JSON buffer.
-pub fn record_batch_from_json<T: Serialize>(
-    arrow_schema: Arc<ArrowSchema>,
-    json: &[T],
-) -> Result<RecordBatch, Box<DataWriterError>> {
-    let mut decoder = ReaderBuilder::new(arrow_schema).build_decoder()?;
-    decoder.serialize(json)?;
-    decoder
-        .flush()?
-        .ok_or(Box::new(DataWriterError::EmptyRecordBatch))
+pub fn record_batch_from_json<T: Serialize>(arrow_schema: Arc<ArrowSchema>, items: &[T]) -> Result<RecordBatch, Box<DataWriterError>> {
+    let fields = arrow_schema.fields();
+    let builder = serde_arrow::ArrayBuilder::from_arrow(fields).unwrap();
+    items
+        .serialize(serde_arrow::Serializer::new(builder))
+        .unwrap()
+        .into_inner()
+        .to_record_batch()
+        .map_err(|_| Box::new(DataWriterError::EmptyRecordBatch))
 }
 
 type BadValue<T> = (T, ParquetError);

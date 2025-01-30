@@ -1,3 +1,4 @@
+//! TODO document
 use crate::{DataTypeOffset, DataTypePartition};
 use deltalake_core::kernel::{Action, Add, Transaction};
 use deltalake_core::{DeltaTable, DeltaTableError};

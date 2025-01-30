@@ -44,7 +44,7 @@ use writer::CanExtractPartition;
 mod coercions;
 /// Doc
 pub mod cursor;
-mod dead_letters;
+pub mod dead_letters;
 pub mod delta_helpers;
 mod metrics;
 mod offsets;
