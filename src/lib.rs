@@ -9,12 +9,10 @@
 
 #[macro_use]
 extern crate lazy_static;
-
-#[macro_use]
-extern crate strum_macros;
-
 #[cfg(test)]
 extern crate serde_json;
+#[macro_use]
+extern crate strum_macros;
 
 use coercions::CoercionTree;
 use deltalake_core::operations::transaction::TableReference;
@@ -30,7 +28,6 @@ use rdkafka::{
     util::Timeout,
     ClientContext, Message, Offset, TopicPartitionList,
 };
-use serde::Serialize;
 use serde_json::Value;
 use serialization::{MessageDeserializer, MessageDeserializerFactory};
 use std::sync::Arc;
@@ -56,6 +53,7 @@ pub mod writer;
 
 use crate::offsets::WriteOffsetsError;
 use crate::value_buffers::{ConsumedBuffers, ValueBuffers};
+use crate::writer::SerializeStrategy;
 use crate::{
     dead_letters::*,
     metrics::*,
@@ -326,7 +324,7 @@ impl Default for IngestOptions {
 
 /// TODO Needs to be documented
 pub async fn start_ingest_custom_transform<
-    T: Serialize + CanExtractPartition + Clone,
+    T: SerializeStrategy + CanExtractPartition + Clone,
     F: transforms::MessageTransformer<T>,
 >(
     topic: String,
@@ -631,7 +629,7 @@ fn fetch_latest_offsets(
 /// When handling a signal, we take out a read lock first to avoid starving the write lock.
 /// If a signal exists and indicates a new partition assignment, we take out a write lock so we can clear it after resetting state.
 async fn handle_rebalance<
-    T: Serialize + CanExtractPartition + Clone,
+    T: SerializeStrategy + CanExtractPartition + Clone,
     F: transforms::MessageTransformer<T>,
 >(
     rebalance_signal: Arc<RwLock<Option<RebalanceSignal>>>,
@@ -769,7 +767,7 @@ enum RebalanceAction {
 /// Holds state and encapsulates functionality required to process messages and write to delta.
 struct IngestProcessor<T, F>
 where
-    T: Serialize + CanExtractPartition + Clone,
+    T: SerializeStrategy + CanExtractPartition + Clone,
     F: transforms::MessageTransformer<T>,
 {
     topic: String,
@@ -790,7 +788,7 @@ where
 
 impl<T, F> IngestProcessor<T, F>
 where
-    T: Serialize + CanExtractPartition + Clone,
+    T: SerializeStrategy + CanExtractPartition + Clone,
     F: transforms::MessageTransformer<T>,
 {
     /// Creates a new ingest [`IngestProcessor`].

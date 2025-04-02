@@ -74,5 +74,5 @@ services:
     command:
       - /localstack-setup_emails.sh
     volumes:
-      - ./bin/localstack-setup_emails.sh:/localstack-setup_emails.sh
-      - "./tests/data/emails/:/data/emails"
+      - ./bin/localstack-setup_emails.sh:/localstack-setup_emails.sh:z
+      - "./tests/data/emails/:/data/emails:z"
