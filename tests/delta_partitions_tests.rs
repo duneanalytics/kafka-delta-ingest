@@ -4,7 +4,6 @@ mod helpers;
 use deltalake_core::kernel::{Action, Add};
 use deltalake_core::operations::transaction::TableReference;
 use deltalake_core::protocol::{DeltaOperation, SaveMode};
-use deltalake_core::DeltaTableError;
 use kafka_delta_ingest::writer::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -128,7 +127,6 @@ async fn test_delta_partitions() {
             operation,
         )
         .await
-        .map_err(DeltaTableError::from)
         .expect("Failed to create transaction")
         .version;
 

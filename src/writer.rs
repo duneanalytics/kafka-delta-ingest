@@ -1,4 +1,5 @@
 //! High-level writer implementations for [`deltalake`].
+use deltalake_core::arrow::json::ReaderBuilder;
 #[allow(deprecated)]
 use deltalake_core::arrow::{
     array::{
@@ -58,9 +59,82 @@ pub trait CanExtractPartition {
 impl CanExtractPartition for Value {
     fn partition_value_based_on_key(&self, field_names: &[String]) -> Vec<String> {
         field_names
-            .into_iter()
+            .iter()
             .map(|field_name| self.get(field_name).unwrap_or(&Value::Null).to_string())
             .collect()
+    }
+}
+
+/// A trait for types that can be serialized into Arrow RecordBatches.
+///
+/// This trait is used to convert serializable data types into Arrow RecordBatches
+/// which can then be written to Parquet files for storage in Delta Lake.
+pub trait SerializeStrategy: Serialize {
+    /// Converts a slice of serializable items into an Arrow RecordBatch.
+    ///
+    /// This method is responsible for taking a collection of serializable items
+    /// and converting them into an Arrow RecordBatch according to the provided schema.
+    ///
+    /// # Arguments
+    ///
+    /// * `arrow_schema` - The Arrow schema that the record batch should conform to
+    /// * `items` - A slice of serializable items to convert
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing either the created `RecordBatch` or a boxed `DataWriterError`
+    fn to_record_batch<T: SerializeStrategy>(
+        arrow_schema: Arc<ArrowSchema>,
+        items: &[T],
+    ) -> Result<RecordBatch, Box<DataWriterError>> {
+        // Use serde_arrow to convert to record batch
+        let fields: &[FieldRef] = arrow_schema.fields().as_ref();
+        let record_batch = serde_arrow::to_record_batch(fields, &items).map_err(|e| {
+            Box::new(DataWriterError::Arrow {
+                source: ArrowError::ExternalError(Box::new(e)),
+            })
+        })?;
+
+        // Validate that the schema matches what we expected
+        if record_batch.schema() != arrow_schema {
+            return Err(Box::new(DataWriterError::SchemaMismatch {
+                record_batch_schema: record_batch.schema(),
+                expected_schema: arrow_schema,
+            }));
+        }
+        Ok(record_batch)
+    }
+}
+
+// Special implementation for JSON values to maintain backwards compatibility
+impl SerializeStrategy for Value {
+    fn to_record_batch<T: SerializeStrategy>(
+        arrow_schema: Arc<ArrowSchema>,
+        items: &[T],
+    ) -> Result<RecordBatch, Box<DataWriterError>> {
+        let mut decoder = ReaderBuilder::new(arrow_schema).build_decoder()?;
+        decoder.serialize(items)?;
+        decoder
+            .flush()?
+            .ok_or(Box::new(DataWriterError::EmptyRecordBatch))
+    }
+}
+
+impl<T: SerializeStrategy> SerializeStrategy for &T {
+    fn to_record_batch<U: SerializeStrategy>(
+        arrow_schema: Arc<ArrowSchema>,
+        items: &[U],
+    ) -> Result<RecordBatch, Box<DataWriterError>> {
+        T::to_record_batch(arrow_schema, items)
+    }
+}
+
+impl<T: SerializeStrategy> SerializeStrategy for Vec<T> {
+    fn to_record_batch<U: SerializeStrategy>(
+        arrow_schema: Arc<ArrowSchema>,
+        items: &[U],
+    ) -> Result<RecordBatch, Box<DataWriterError>> {
+        T::to_record_batch(arrow_schema, items)
     }
 }
 
@@ -207,7 +281,7 @@ pub(crate) struct DataArrowWriter {
 impl DataArrowWriter {
     /// Writes the given JSON buffer and updates internal state accordingly.
     /// This method buffers the write stream internally so it can be invoked for many json buffers and flushed after the appropriate number of bytes has been written.
-    async fn write_values<T: Serialize + Clone>(
+    async fn write_values<T: SerializeStrategy + Clone>(
         &mut self,
         partition_columns: &[String],
         arrow_schema: Arc<ArrowSchema>,
@@ -240,7 +314,7 @@ impl DataArrowWriter {
         }
     }
 
-    async fn write_partial<T: Serialize + Clone>(
+    async fn write_partial<T: SerializeStrategy + Clone>(
         &mut self,
         partition_columns: &[String],
         arrow_schema: Arc<ArrowSchema>,
@@ -407,7 +481,7 @@ impl DataWriter {
     }
 
     /// Writes the given values to internal parquet buffers for each represented partition.
-    pub async fn write<T: Serialize + CanExtractPartition + Clone>(
+    pub async fn write<T: SerializeStrategy + CanExtractPartition + Clone>(
         &mut self,
         values: Vec<ValuesFromSingleMessage<T>>,
     ) -> Result<(), Box<DataWriterError>> {
@@ -427,7 +501,7 @@ impl DataWriter {
                 )));
             }
             for (k, v) in r {
-                res.entry(k).or_insert_with(Vec::new).push(v);
+                res.entry(k).or_default().push(v);
             }
         }
         for (key, values) in res {
@@ -631,27 +705,23 @@ impl DataWriter {
                     predicate: None,
                 },
             )
-            .await
-            .map_err(DeltaTableError::from)?;
+            .await?;
         Ok(commit.version)
     }
 }
 
-/// Creates an Arrow RecordBatch from the passed JSON buffer.
-pub fn record_batch_from_json<T: Serialize>(arrow_schema: Arc<ArrowSchema>, items: &[T]) -> Result<RecordBatch, Box<DataWriterError>> {
-    let fields = arrow_schema.fields();
-    let builder = serde_arrow::ArrayBuilder::from_arrow(fields).unwrap();
-    items
-        .serialize(serde_arrow::Serializer::new(builder))
-        .unwrap()
-        .into_inner()
-        .to_record_batch()
-        .map_err(|_| Box::new(DataWriterError::EmptyRecordBatch))
+/// Creates an Arrow RecordBatch from the passed serializable items.
+pub fn record_batch_from_json<T: SerializeStrategy>(
+    arrow_schema: Arc<ArrowSchema>,
+    items: &[T],
+) -> Result<RecordBatch, Box<DataWriterError>> {
+    T::to_record_batch(arrow_schema, items)
 }
 
 type BadValue<T> = (T, ParquetError);
 
-fn quarantine_failed_parquet_rows<T: Serialize + Clone>(
+#[allow(clippy::type_complexity)]
+fn quarantine_failed_parquet_rows<T: SerializeStrategy + Clone>(
     arrow_schema: Arc<ArrowSchema>,
     values: Vec<T>,
 ) -> Result<(Vec<T>, Vec<BadValue<T>>), Box<DataWriterError>> {
@@ -688,13 +758,6 @@ fn collect_partial_write_failure(
         _ => writer_result,
     }
 }
-
-// fn get_field_as_value<T: Serialize>(instance: &T, field_name: &str) -> Option<Value> {
-//     // Serialize the instance into a JSON Value
-//     let serialized = serde_json::to_value(instance).ok()?;
-//     // Get the specific field by its name
-//     serialized.get(field_name).cloned()
-// }
 
 fn min_max_values_from_file_metadata(
     partition_values: &HashMap<String, Option<String>>,
@@ -1215,7 +1278,7 @@ mod tests {
             .unwrap();
         assert_eq!(add.len(), 1);
         let stats: deltalake_core::protocol::Stats =
-            serde_json::from_str(&add[0].stats.as_ref().unwrap()).expect("Failed to parse stats");
+            serde_json::from_str(add[0].stats.as_ref().unwrap()).expect("Failed to parse stats");
 
         let min_max_keys = vec!["meta", "some_int", "some_string", "some_bool"];
         let mut null_count_keys = vec!["some_list", "some_nested_list"];
