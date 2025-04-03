@@ -2,9 +2,9 @@ name: build
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 04-02-fix_tests ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, 04-02-fix_tests ]
 
 jobs:
   format:
