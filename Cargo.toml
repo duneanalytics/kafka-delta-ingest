@@ -25,9 +25,9 @@ rdkafka = { version = "0.28", features = ["ssl"] }
 schema_registry_converter = { version = "3.1.0", features = ["easy", "json", "avro"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_arrow = { version = "0.12.3", features = ["arrow-53"] }
-strum = "0.20"
-strum_macros = "0.20"
+serde_arrow = { version = "0.13.0", features = ["arrow-54"] }
+strum = "0.27.1"
+strum_macros = "0.27.1"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0", features = ["fs"] }
@@ -36,12 +36,9 @@ uuid = { version = "0.8", features = ["serde", "v4"] }
 url = "2.3"
 
 # datafusion feature is required for writer version 2
-#deltalake-core = { version = "0.23.0", features = ["json", "datafusion"]}
-#deltalake-aws = { version = "0.6.0", optional = true }
-#deltalake-azure = { version = "0.6.0", optional = true }
-deltalake-core = { git = "https://github.com/buoyant-data/delta-rs", branch = "default-engine-rustls", features = ["json", "datafusion"] }
-deltalake-aws = { git = "https://github.com/buoyant-data/delta-rs", branch = "default-engine-rustls", optional = true }
-deltalake-azure= { git = "https://github.com/buoyant-data/delta-rs", branch = "default-engine-rustls", optional = true }
+deltalake-core = { version = "0.25.0", features = ["json", "datafusion"]} # add "rustls" feature soon
+deltalake-aws = { version = "0.8.0", optional = true }
+deltalake-azure = { version = "0.8.0", optional = true }
 
 # s3 feature enabled, helps for locking interactions with DLQ
 dynamodb_lock = { version = "0.6.0", optional = true }
@@ -74,3 +71,10 @@ utime = "0.3"
 
 [profile.release]
 lto = true
+
+#[patch."https://github.com/buoyant-data/delta-rs"]
+#strum = { version = "0.27.1" }
+#strum_macros = { version = "0.27.1" }
+#[patch."https://github.com/delta-io/delta-kernel-rs"]
+#strum = { version = "0.27.1" }
+#strum_macros = { version = "0.27.1" }

@@ -87,14 +87,9 @@ pub trait SerializeStrategy: Serialize {
         arrow_schema: Arc<ArrowSchema>,
         items: &[T],
     ) -> Result<RecordBatch, Box<DataWriterError>> {
-        // Get the fields from the schema as FieldRef
-        let fields: Vec<Arc<Field>> = arrow_schema.fields().iter().cloned().collect();
-
-        // Create a wrapper Vec to serialize the items as a sequence
-        let items_wrapper = items;
-
         // Use serde_arrow to convert to record batch
-        let record_batch = serde_arrow::to_record_batch(&fields, &items_wrapper).map_err(|e| {
+        let fields: &[FieldRef] = arrow_schema.fields().as_ref();
+        let record_batch = serde_arrow::to_record_batch(fields, &items).map_err(|e| {
             Box::new(DataWriterError::Arrow {
                 source: ArrowError::ExternalError(Box::new(e)),
             })
