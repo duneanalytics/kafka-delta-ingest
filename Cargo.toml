@@ -71,10 +71,3 @@ utime = "0.3"
 
 [profile.release]
 lto = true
-
-#[patch."https://github.com/buoyant-data/delta-rs"]
-#strum = { version = "0.27.1" }
-#strum_macros = { version = "0.27.1" }
-#[patch."https://github.com/delta-io/delta-kernel-rs"]
-#strum = { version = "0.27.1" }
-#strum_macros = { version = "0.27.1" }

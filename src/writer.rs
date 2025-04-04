@@ -59,7 +59,7 @@ pub trait CanExtractPartition {
 impl CanExtractPartition for Value {
     fn partition_value_based_on_key(&self, field_names: &[String]) -> Vec<String> {
         field_names
-            .into_iter()
+            .iter()
             .map(|field_name| self.get(field_name).unwrap_or(&Value::Null).to_string())
             .collect()
     }
@@ -120,7 +120,7 @@ impl SerializeStrategy for Value {
     }
 }
 
-impl<'a, T: SerializeStrategy> SerializeStrategy for &'a T {
+impl<T: SerializeStrategy> SerializeStrategy for &T {
     fn to_record_batch<U: SerializeStrategy>(
         arrow_schema: Arc<ArrowSchema>,
         items: &[U],
@@ -501,7 +501,7 @@ impl DataWriter {
                 )));
             }
             for (k, v) in r {
-                res.entry(k).or_insert_with(Vec::new).push(v);
+                res.entry(k).or_default().push(v);
             }
         }
         for (key, values) in res {
@@ -705,8 +705,7 @@ impl DataWriter {
                     predicate: None,
                 },
             )
-            .await
-            .map_err(DeltaTableError::from)?;
+            .await?;
         Ok(commit.version)
     }
 }
@@ -721,6 +720,7 @@ pub fn record_batch_from_json<T: SerializeStrategy>(
 
 type BadValue<T> = (T, ParquetError);
 
+#[allow(clippy::type_complexity)]
 fn quarantine_failed_parquet_rows<T: SerializeStrategy + Clone>(
     arrow_schema: Arc<ArrowSchema>,
     values: Vec<T>,
@@ -1278,7 +1278,7 @@ mod tests {
             .unwrap();
         assert_eq!(add.len(), 1);
         let stats: deltalake_core::protocol::Stats =
-            serde_json::from_str(&add[0].stats.as_ref().unwrap()).expect("Failed to parse stats");
+            serde_json::from_str(add[0].stats.as_ref().unwrap()).expect("Failed to parse stats");
 
         let min_max_keys = vec!["meta", "some_int", "some_string", "some_bool"];
         let mut null_count_keys = vec!["some_list", "some_nested_list"];

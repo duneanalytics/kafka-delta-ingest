@@ -970,7 +970,7 @@ where
             info!("Table schema has been updated");
             // Update the coercion tree to reflect the new schema
             self.message_transformer
-                .on_schema_change(&self.table.schema().unwrap());
+                .on_schema_change(self.table.schema().unwrap());
 
             return Err(IngestError::DeltaSchemaChanged);
         }
@@ -994,8 +994,7 @@ where
                         epoch_id,
                     },
                 )
-                .await
-                .map_err(DeltaTableError::from);
+                .await;
             match commit {
                 Ok(v) => {
                     /*if v != version {
